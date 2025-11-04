@@ -32,7 +32,15 @@ Please submit by groups after forming an organization (clike your name on the to
 
 Please use andrew email to register only. If you have any questions, email me or post a discussion on canvas.
 
+## Clarification (Newly added 11.3)
+
+As some of you have asked about the details of the project, we confirm some settings here:
+ - All three models are trained with LORA, the same setting `-m gpt2 --block_size 512 --epochs 3 --batch_size 8 --gradient_accumulation_steps 1 --lr 2e-4 --lora --lora_r 32 --lora_alpha 64 --lora_dropout 0.05`. The only differences are the training data. (10k training data for each but 3 different sets).
+ - You may find out that train phase training data is actually achieved by setting `seed=42` in "data/prepare_data.py". To train other shadow models, remember to change the seed number.
+ - I suggest you train your shadow models with the same config to start, once you achieved like 10% TPR at 1% FPR, you may do the hyperparameter tuning and other training configs that you feel reasonable.
+
+
 ## Report
-stay tuned for the report format
+stay tuned for the report content and format.
 
 
