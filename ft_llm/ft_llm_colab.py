@@ -35,8 +35,9 @@ def _read_json(path: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", default="./data/fixed_wiki2")
-    ap.add_argument("--train_file", default="train_finetune.json")
+    # ap.add_argument("--data_dir", default="./data/fixed_wiki2")
+    ap.add_argument("--data_dir", default="./wiki_json/train")
+    ap.add_argument("--train_file", default="train_shadow.json")
 
     ap.add_argument("--model_name", "-m", default="gpt2")
     ap.add_argument("--block_size", type=int, default=256)

@@ -8,7 +8,7 @@ from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
 
 OUTDIR = "wiki_json"
-SEED = 42
+SEED = 33
 TRAIN_PER_SRC = 10_000
 MIN_TOKENS = 25
 
@@ -71,7 +71,7 @@ def main():
 
     out_dir = Path(OUTDIR)
     train_json = [{"text": ex["text"]} for ex in wiki_train]
-    dump_json(out_dir / "train_finetune.json", train_json)
+    dump_json(out_dir / f"train_finetune_{SEED}.json", train_json)
 
     print("[OK] JSON saved to", OUTDIR)
 
