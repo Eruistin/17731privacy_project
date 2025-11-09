@@ -13,6 +13,7 @@ from typing import List, Tuple, Optional, Dict
 from datasets import Dataset
 import torch.nn.functional as F
 import zlib
+from tqdm import tqdm
 from peft import PeftModel, PeftConfig
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, cross_val_score
@@ -49,7 +50,7 @@ def extract_lm_features(
     features = []
     dl, text_list = build_dataloader(path, tokenizer, block_size, batch_size)
 
-    for batch_idx, batch in enumerate(dl):
+    for batch_idx, batch in enumerate(tqdm(dl)):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"][:, :-1].to(device)
@@ -93,8 +94,8 @@ def extract_lm_features(
 
         # zlib compression ratio baseline
         start = batch_idx * batch_size
-        end = start + len(text_list[start:end])
-        for i, txt in enumerate(text):
+        end = start + len(batch["input_ids"])
+        for i, txt in enumerate(text_list[start:end]):
             raw = txt.encode("utf-8")
             comp = zlib.compress(raw)
             z_ratio = len(comp) / max(1, len(raw))
@@ -105,7 +106,7 @@ def extract_lm_features(
                 float(avg_token_entropy[i]),
                 float(seq_len_arr[i]),
                 float(z_ratio),
-                float(0.0)  # placeholder for "correct_flag" if we had labels in future
+                # float(0.0)  # placeholder for "correct_flag" if we had labels in future
             ]
             features.append(feats)
 
