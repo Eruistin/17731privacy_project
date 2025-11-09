@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from sklearn.metrics import roc_auc_score, roc_curve, auc as _auc
 import matplotlib.pyplot as plt
 import json
+import concurrent.futures
 from pathlib import Path
 from torch.utils.data import DataLoader
 from typing import List, Tuple, Optional, Dict
@@ -56,59 +57,43 @@ def extract_lm_features(
         labels = batch["labels"][:, :-1].to(device)
 
         outputs = model(input_ids, attention_mask=attention_mask)
-        logits = outputs.logits  # (B, L, V)
-        log_probs = F.log_softmax(logits, dim=-1)  # (B,L,V)
+        logits = outputs.logits
+        log_probs = F.log_softmax(logits, dim=-1)
 
         lp = log_probs[:, :-1, :]           # (B, L-1, V)
         am = attention_mask[:, 1:].bool()   # (B, L-1)
 
-        labels_expanded = labels.unsqueeze(-1)  # (B, L-1, 1)
-        token_logp = torch.gather(lp, dim=-1, index=labels_expanded).squeeze(-1)  # (B, L-1)
-        token_logp = token_logp * am
+        token_logp = torch.gather(lp, -1, labels.unsqueeze(-1)).squeeze(-1)
+        token_logp = token_logp.masked_fill(~am, 0.0)
 
-        # but we want per-sample metrics: compute sums and counts per sample
-        # compute per-sample sum and counts
-        # To do per-sample: set masked positions to 0 and sum, count via am.sum
-        token_logp_zeroed = token_logp.clone()
-        token_logp_zeroed[~am] = 0.0
-        sum_logp = token_logp_zeroed.sum(dim=1).cpu().numpy()  # (B,)
-        token_counts = am.sum(dim=1).cpu().numpy()            # (B,)
+        sum_logp = token_logp.sum(dim=1)
+        token_counts = am.sum(dim=1)
+        avg_neg_nll = - (sum_logp / token_counts.clamp(min=1))
 
-        avg_neg_nll = - (sum_logp / np.maximum(token_counts, 1))  # (B,) average negative log likelihood
+        token_max_logp = lp.max(dim=-1).values.masked_fill(~am, 0.0)  # (B, L-1)
+        avg_token_max_prob = token_max_logp.exp().sum(dim=1) / token_counts.clamp(min=1)
 
-        # per-token max prob and entropy
-        # max prob per token
-        token_max_logp, _ = lp.max(dim=-1)  # (B, L-1)
-        token_max_logp[~am] = 0.0
-        avg_token_max_prob = token_max_logp.exp().sum(dim=1).cpu().numpy() / np.maximum(token_counts, 1)
+        token_ent = -(lp * lp.exp()).sum(dim=-1).masked_fill(~am, 0.0)
+        avg_token_entropy = token_ent.sum(dim=1) / token_counts.clamp(min=1)
 
-        # entropy per token: -sum p*logp
-        token_p = lp.exp()  # (B, L-1, V)
-        # compute p * log p then sum across V. Care memory: compute entropy via -sum(p*logp)
-        token_ent = -(lp * token_p).sum(dim=-1)  # (B, L-1)
-        token_ent[~am] = 0.0
-        avg_token_entropy = token_ent.sum(dim=1).cpu().numpy() / np.maximum(token_counts, 1)
+        seq_len_arr = token_counts
 
-        # seq_len numeric
-        seq_len_arr = token_counts  # number tokens considered
-
-        # zlib compression ratio baseline
         start = batch_idx * batch_size
         end = start + len(batch["input_ids"])
-        for i, txt in enumerate(text_list[start:end]):
-            raw = txt.encode("utf-8")
-            comp = zlib.compress(raw)
-            z_ratio = len(comp) / max(1, len(raw))
-            # gather per-index features
-            feats = [
-                float(avg_neg_nll[i]),
-                float(avg_token_max_prob[i]),
-                float(avg_token_entropy[i]),
-                float(seq_len_arr[i]),
-                float(z_ratio),
-                # float(0.0)  # placeholder for "correct_flag" if we had labels in future
-            ]
-            features.append(feats)
+        batch_texts = text_list[start:end]
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            z_ratios = list(executor.map(lambda txt: len(zlib.compress(txt.encode("utf-8"))) / max(1, len(txt.encode("utf-8"))), batch_texts))
+
+        batch_feats = torch.stack([
+            avg_neg_nll,
+            avg_token_max_prob,
+            avg_token_entropy,
+            seq_len_arr
+        ], dim=1).cpu().numpy()
+
+        for i in range(len(batch_feats)):
+            features.append(list(batch_feats[i]) + [z_ratios[i]])
 
     return np.vstack(features)
 
