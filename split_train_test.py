@@ -13,7 +13,7 @@ def _write_json(path, data):
 
 
 def main():
-    SEED = 33
+    SEED = 1024
     path = Path(f"./wiki_json/train_finetune_{SEED}.json")
     texts = _read_json(path)
     random.seed(SEED)
