@@ -40,62 +40,102 @@ def extract_lm_features(
     model,
     path,
     tokenizer,
-    block_size,
-    batch_size,
+    block_size: int,
+    batch_size: int,
     device: torch.device,
-    max_length: int = 512,
+    nll_percentiles=(10, 50, 90),
 ):
-
     model.eval()
 
-    features = []
-    dl, text_list = build_dataloader(path, tokenizer, block_size, batch_size)
+    dl, _ = build_dataloader(path, tokenizer, block_size, batch_size)
 
-    for batch_idx, batch in enumerate(tqdm(dl)):
-        input_ids = batch["input_ids"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        labels = batch["labels"][:, :-1].to(device)
+    feat_rows = []
+    feat_names = [
+        "avg_neg_nll",
+        "avg_token_max_prob",
+        "avg_token_entropy",
+        "seq_len",
+        "avg_top1_top2_gap",
+        *[f"nll_p{p}" for p in nll_percentiles],
+        "nll_std",
+    ]
 
+    for batch in tqdm(dl, desc="extract_feats"):
+        input_ids = batch["input_ids"].to(device)            # (B, L)
+        attention_mask = batch["attention_mask"].to(device)  # (B, L)
+        # labels for next-token: shift left by 1 (predict token t given <=t-1)
+        labels = batch["labels"][:, 1:].to(device)           # (B, L-1)
+
+        # forward
         outputs = model(input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        log_probs = F.log_softmax(logits, dim=-1)
+        logits = outputs.logits                                # (B, L, V)
 
-        lp = log_probs[:, :-1, :]           # (B, L-1, V)
-        am = attention_mask[:, 1:].bool()   # (B, L-1)
+        # log probs for convenience (but keep logits for entropy)
+        log_probs = F.log_softmax(logits, dim=-1)             # (B, L, V)
+        lp = log_probs[:, :-1, :]                              # (B, L-1, V)
+        am = attention_mask[:, 1:].bool()                      # (B, L-1)
 
-        token_logp = torch.gather(lp, -1, labels.unsqueeze(-1)).squeeze(-1)
-        token_logp = token_logp.masked_fill(~am, 0.0)
+        # token-level logp of true token (masked)
+        token_logp = torch.gather(lp, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
+        token_logp = token_logp.masked_fill(~am, 0.0)           # zero out padded positions
 
-        sum_logp = token_logp.sum(dim=1)
-        token_counts = am.sum(dim=1)
-        avg_neg_nll = - (sum_logp / token_counts.clamp(min=1))
+        token_counts = am.sum(dim=1)                           # (B,)
+        sum_logp = token_logp.sum(dim=1)                       # (B,)
+        avg_neg_nll = -(sum_logp / token_counts.clamp(min=1)).cpu().numpy()  # (B,)
 
+        # avg token max prob
         token_max_logp = lp.max(dim=-1).values.masked_fill(~am, 0.0)  # (B, L-1)
-        avg_token_max_prob = token_max_logp.exp().sum(dim=1) / token_counts.clamp(min=1)
+        avg_token_max_prob = (token_max_logp.exp().sum(dim=1) / token_counts.clamp(min=1)).cpu().numpy()
 
-        token_ent = -(lp * lp.exp()).sum(dim=-1).masked_fill(~am, 0.0)
-        avg_token_entropy = token_ent.sum(dim=1) / token_counts.clamp(min=1)
+        # entropy via categorical entropy (memory friendly)
+        ent = torch.distributions.Categorical(logits=logits[:, :-1, :]).entropy().masked_fill(~am, 0.0)  # (B, L-1)
+        avg_token_entropy = (ent.sum(dim=1) / token_counts.clamp(min=1)).cpu().numpy()
 
-        seq_len_arr = token_counts
+        # top1-top2 gap (probability gap averaged across valid tokens)
+        topk_logp = lp.topk(2, dim=-1).values                    # (B, L-1, 2)
+        gap = (topk_logp[..., 0] - topk_logp[..., 1]).exp()     # prob gap per token
+        gap = gap.masked_fill(~am, 0.0)
+        avg_gap = (gap.sum(dim=1) / token_counts.clamp(min=1)).cpu().numpy()
 
-        start = batch_idx * batch_size
-        end = start + len(batch["input_ids"])
-        batch_texts = text_list[start:end]
+        seq_len_arr = token_counts.cpu().numpy()
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            z_ratios = list(executor.map(lambda txt: len(zlib.compress(txt.encode("utf-8"))) / max(1, len(txt.encode("utf-8"))), batch_texts))
+        # per-sample per-token NLL arrays -> compute percentiles & std
+        B = input_ids.size(0)
+        token_nll_lists = []
+        for i in range(B):
+            valid_logps = token_logp[i][am[i]].cpu().numpy()   # logp for valid tokens
+            if valid_logps.size == 0:
+                token_nll_lists.append(np.array([np.nan]))
+            else:
+                token_nll_lists.append(-valid_logps)  # convert to positive NLLs
 
-        batch_feats = torch.stack([
-            avg_neg_nll,
-            avg_token_max_prob,
-            avg_token_entropy,
-            seq_len_arr
-        ], dim=1).cpu().numpy()
+        p_arrays = {p: [] for p in nll_percentiles}
+        stds = []
+        for arr in token_nll_lists:
+            if np.isnan(arr).all():
+                for p in nll_percentiles:
+                    p_arrays[p].append(np.nan)
+                stds.append(np.nan)
+            else:
+                for p in nll_percentiles:
+                    p_arrays[p].append(np.percentile(arr, p))
+                stds.append(np.std(arr, ddof=1))
 
-        for i in range(len(batch_feats)):
-            features.append(list(batch_feats[i]) + [z_ratios[i]])
+        # assemble rows
+        for i in range(B):
+            row = [
+                float(avg_neg_nll[i]),
+                float(avg_token_max_prob[i]),
+                float(avg_token_entropy[i]),
+                float(seq_len_arr[i]),
+                float(avg_gap[i]),
+                *[float(p_arrays[p][i]) for p in nll_percentiles],
+                float(stds[i]),
+            ]
+            feat_rows.append(row)
 
-    return np.vstack(features)
+    X = np.vstack(feat_rows) if len(feat_rows) > 0 else np.zeros((0, len(feat_names)))
+    return X
 
 
 def build_dataloader(path, tokenizer, block_size, batch_size):

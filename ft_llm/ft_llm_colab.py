@@ -73,6 +73,7 @@ def main():
         return t is not None and len(t.strip()) > 0
 
     train_raw = ds.filter(non_empty_text)
+    print(train_raw)
 
     tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
     if tok.pad_token is None:
