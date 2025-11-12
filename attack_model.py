@@ -337,8 +337,9 @@ def build_shadow_attack_dataset(
         print(f"[+] Processing shadow seed {seed}")
         train_path = Path(shadow_data_template[0].format(seed=seed))
         test_path = Path(shadow_data_template[1].format(seed=seed))
-        assert train_path.exists(), f"{train_path} not found"
-        assert test_path.exists(), f"{test_path} not found"
+        if not (train_path.exists() and test_path.exists()):
+            print(f"Files of {seed} not found.")
+            continue
 
 
         model_dir = shadow_model_dir_template.format(seed=seed)
@@ -464,9 +465,9 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
 def main():
     parser = argparse.ArgumentParser()
     # parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99,111,123,256,333,512,1024],
-    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99],
+    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33],
                         help="list of seeds used to build shadow datasets")
-    parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
+    parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
                         help="format template for shadow model directories")
     parser.add_argument("--shadow_data_template", nargs=2, type=str,
                         default=("wiki_json/train/train_shadow_{seed}.json", "wiki_json/test/test_shadow_{seed}.json"),

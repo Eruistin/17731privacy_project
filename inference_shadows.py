@@ -54,25 +54,13 @@ def inference(
     for batch in tqdm(dl, desc="extract_feats"):
         input_ids = batch["input_ids"].to(device)            # (B, L)
         attention_mask = batch["attention_mask"].to(device)  # (B, L)
-        labels = batch["labels"][:, 1:].to(device)           # (B, L-1)
-        orig_idx = batch["orig_idx"].cpu().numpy()
 
         logits_ft = model(input_ids, attention_mask=attention_mask).logits
-        logits_fts.append(logits_ft)
+        logits_fts.append(logits_ft.cpu().numpy())
 
         with model.disable_adapter():
             logits_base = model(input_ids, attention_mask=attention_mask).logits
-            logits_bases.append(logits_base)
-
-
-    feat_rows = []
-    for oid in sorted(per_sample_rows.keys()):
-        arr = np.stack(per_sample_rows[oid], axis=0)  # (num_chunks, D)
-        # 对“极值类”特征取 max/p95，对“均值类”取均值；简化起见先全用 max 再 concat(mean)
-        f_max = np.nanmax(arr, axis=0)
-        f_mean = np.nanmean(arr, axis=0)
-        feat = np.concatenate([f_max, f_mean], axis=0)  # D*2
-        feat_rows.append(feat)
+            logits_bases.append(logits_base.cpu().numpy())
 
     logits_bases = np.asarray(logits_bases, dtype=np.float32)
     logits_fts = np.asarray(logits_fts, dtype=np.float32)
@@ -195,9 +183,9 @@ def build_shadow_attack_dataset(
 def main():
     parser = argparse.ArgumentParser()
     # parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99,111,123,256,333,512,1024],
-    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99],
+    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33],
                         help="list of seeds used to build shadow datasets")
-    parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
+    parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
                         help="format template for shadow model directories")
     parser.add_argument("--shadow_data_template", nargs=2, type=str,
                         default=("wiki_json/train/train_shadow_{seed}.json", "wiki_json/test/test_shadow_{seed}.json"),
