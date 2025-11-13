@@ -379,6 +379,7 @@ def feval_tpr_at_001(y_pred, dtrain):
 def train_attack_model(X, y, out_dir: Path, random_state=42):
     print("Attack dataset shape:", X.shape, y.sum(), "members,", len(y)-y.sum(), "non-members")
     # split
+    out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "attack_X.npy", X)
     np.save(out_dir / "attack_y.npy", y)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=random_state, stratify=y)
@@ -428,7 +429,7 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
 
     print(f"Validation AUC = {auc_score:.4f}, TPR@FPR=0.01 = {tpr_at_target:.4f}")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    
     print("Saved attack dataset to", out_dir)
     return clf, (auc_score, tpr_at_target)
 
