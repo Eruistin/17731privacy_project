@@ -14,7 +14,6 @@ from torch.utils.data import DataLoader
 from typing import List, Tuple, Optional, Dict
 from datasets import Dataset
 import torch.nn.functional as F
-import zlib
 from tqdm import tqdm
 from peft import PeftModel, PeftConfig
 from sklearn.ensemble import RandomForestClassifier
@@ -139,8 +138,6 @@ def extract_lm_features(
     model.eval()
 
     dl, _ = build_dataloader(path, tokenizer, block_size, batch_size)
-    # 用 dict 聚合同一 orig_idx 的特征（你已有的行级 row 先收集，最后按 orig_idx 聚合）
-    per_sample_rows = {}  # orig_idx -> list of feature rows (np.array)
 
     feat_rows = []
 
@@ -148,30 +145,35 @@ def extract_lm_features(
         input_ids = batch["input_ids"].to(device)            # (B, L)
         attention_mask = batch["attention_mask"].to(device)  # (B, L)
         labels = batch["labels"][:, 1:].to(device)           # (B, L-1)
-        orig_idx = batch["orig_idx"].cpu().numpy()
 
-        logits_ft = model(input_ids, attention_mask=attention_mask).logits
-        m_ft = _token_metrics_from_logits(logits_ft, labels, attention_mask)
+        # forward
+        outputs = model(input_ids, attention_mask=attention_mask)
+        logits = outputs.logits                                # (B, L, V)
+        m_ft = _token_metrics_from_logits(logits, labels, attention_mask)
 
         with model.disable_adapter():
             logits_base = model(input_ids, attention_mask=attention_mask).logits
         m_base = _token_metrics_from_logits(logits_base, labels, attention_mask)
 
+        # ΔNLL & 其他差异
         B = input_ids.size(0)
         am = m_ft["am"]
-        true_lp_ft = m_ft["true_lp"]
+        true_lp_ft = m_ft["true_lp"]           # (B, L-1)
         true_lp_base = m_base["true_lp"]
-        d_true_nll = -(true_lp_ft) - (-(true_lp_base))
-        d_true_nll = d_true_nll.masked_fill(~am, 0.0)
-        delta_nll = -d_true_nll
+        d_true_nll = -(true_lp_ft) - (-(true_lp_base))  # = NLL_ft - NLL_base
+        d_true_nll = d_true_nll.masked_fill(~am, 0.0)   # (B, L-1)
+        # 我们更常用 Δ = NLL_base - NLL_ft
+        delta_nll = -d_true_nll  # (B, L-1)
 
         token_counts = m_ft["token_counts"]
 
+        # 序列级 Δ 统计
         def seq_stat(x, am, reduce="mean"):
             x = x.masked_fill(~am, 0.0)
             if reduce == "mean":
                 return (x.sum(dim=1) / token_counts.clamp(min=1))
             elif reduce == "std":
+                # 逐样本有效 token 的 std
                 arr=[]
                 for i in range(B):
                     v = x[i][am[i]].detach().cpu().numpy()
@@ -183,6 +185,7 @@ def extract_lm_features(
         delta_nll_mean = seq_stat(delta_nll, am, "mean")   # (B,)
         delta_nll_std  = seq_stat(delta_nll, am, "std")    # (B,)
 
+        # ΔNLL 的分位数（逐样本）
         p_arrays = {p: [] for p in nll_percentiles}
         for i in range(B):
             v = delta_nll[i][am[i]].detach().cpu().numpy()
@@ -191,21 +194,6 @@ def extract_lm_features(
             else:
                 for p in nll_percentiles: p_arrays[p].append(np.percentile(v, p))
 
-        delta_nll_np = delta_nll.detach().cpu().numpy()
-        am_np = am.detach().cpu().numpy()
-        win_max = _window_aggregate(delta_nll_np, am_np, win=128, stride=128, reduce="max")
-        win_p95 = _window_aggregate(delta_nll_np, am_np, win=128, stride=128, reduce="p95")
-
-        hit1_ft = m_ft["hit_top1_frac"].detach().cpu().numpy()
-        hit5_ft = m_ft["hit_top5_frac"].detach().cpu().numpy()
-        run99_ft = m_ft["max_run_p099"].detach().cpu().numpy()
-
-        base_avg_nll = m_base["avg_neg_nll"].detach().cpu().numpy()
-        ft_avg_nll   = m_ft["avg_neg_nll"].detach().cpu().numpy()
-        base_entropy = m_base["avg_token_entropy"].detach().cpu().numpy()
-        ft_entropy   = m_ft["avg_token_entropy"].detach().cpu().numpy()
-        base_gap     = m_base["avg_gap"].detach().cpu().numpy()
-        ft_gap       = m_ft["avg_gap"].detach().cpu().numpy()
         # 改进比例
         improved_frac = []
         for i in range(B):
@@ -217,20 +205,41 @@ def extract_lm_features(
                 improved_frac.append(float((vf > vb).float().mean().item()))
         improved_frac = np.array(improved_frac, dtype=np.float32)
 
+        # 窗口极值（对 ΔNLL 做窗口 max / p95）
+        delta_nll_np = delta_nll.detach().cpu().numpy()
+        am_np = am.detach().cpu().numpy()
+        win_max = _window_aggregate(delta_nll_np, am_np, win=128, stride=128, reduce="max")
+        win_p95 = _window_aggregate(delta_nll_np, am_np, win=128, stride=128, reduce="p95")
+
+        # top-k 命中、尖峰 run
+        hit1_ft = m_ft["hit_top1_frac"].detach().cpu().numpy()
+        hit5_ft = m_ft["hit_top5_frac"].detach().cpu().numpy()
+        run99_ft = m_ft["max_run_p099"].detach().cpu().numpy()
+
+        # 基础统计（ft & base）
+        base_avg_nll = m_base["avg_neg_nll"].detach().cpu().numpy()
+        ft_avg_nll   = m_ft["avg_neg_nll"].detach().cpu().numpy()
+        base_entropy = m_base["avg_token_entropy"].detach().cpu().numpy()
+        ft_entropy   = m_ft["avg_token_entropy"].detach().cpu().numpy()
+        base_gap     = m_base["avg_gap"].detach().cpu().numpy()
+        ft_gap       = m_ft["avg_gap"].detach().cpu().numpy()
+
         for i in range(B):
             row = [
                 float(ft_avg_nll[i]),
                 float(base_avg_nll[i]),
-                float(base_avg_nll[i]-ft_avg_nll[i]),
+                float(base_avg_nll[i]-ft_avg_nll[i]),  # Δavg (base-ft)
                 float(ft_entropy[i]),
                 float(base_entropy[i]),
                 float(base_entropy[i]-ft_entropy[i]),
                 float(ft_gap[i]),
                 float(base_gap[i]),
                 float(ft_gap[i]-base_gap[i]),
+
                 float(hit1_ft[i]),
                 float(hit5_ft[i]),
                 float(run99_ft[i]),
+
                 float(delta_nll_mean[i].item()),
                 float(delta_nll_std[i].item()),
                 float(improved_frac[i]),
@@ -239,70 +248,17 @@ def extract_lm_features(
             ]
             for p in nll_percentiles:
                 row.append(float(p_arrays[p][i]))
-
-            oid = int(orig_idx[i])
-            per_sample_rows.setdefault(oid, []).append(np.array(row, dtype=np.float32))
-
-    feat_rows = []
-    for oid in sorted(per_sample_rows.keys()):
-        arr = np.stack(per_sample_rows[oid], axis=0)  # (num_chunks, D)
-        # 对“极值类”特征取 max/p95，对“均值类”取均值；简化起见先全用 max 再 concat(mean)
-        f_max = np.nanmax(arr, axis=0)
-        f_mean = np.nanmean(arr, axis=0)
-        feat = np.concatenate([f_max, f_mean], axis=0)  # D*2
-        feat_rows.append(feat)
+            feat_rows.append(row)
 
     X = np.asarray(feat_rows, dtype=np.float32)
-    return X
-
-
-def tokenize_dataset_with_overflow(texts, tok, max_len, stride=None):
-    if stride is None:
-        stride = max_len // 4  # 例如 128
-    enc = tok(
-        texts,
-        truncation=True,
-        max_length=max_len,
-        stride=stride,
-        padding=False,
-        return_overflowing_tokens=True,
-        return_attention_mask=True,
-        return_length=True,
-    )
-    # overflow_to_sample_mapping 告诉你每个 chunk 来自哪条原文本
-    mapping = enc["overflow_to_sample_mapping"]
-    input_ids = enc["input_ids"]
-    attention_mask = enc["attention_mask"]
-
-    # 构建 labels 并右对齐 pad 到 max_len，便于 batch
-    def pad_to_max(x, pad_id):
-        return x + [pad_id] * (max_len - len(x))
-    pad_id = tok.eos_token_id
-
-    rows = []
-    for i in range(len(input_ids)):
-        ids = input_ids[i]
-        am = attention_mask[i]
-        if len(ids) > max_len:
-            ids = ids[:max_len]
-            am = am[:max_len]
-        ids = pad_to_max(ids, pad_id)
-        am = pad_to_max(am, 0)
-        rows.append({
-            "input_ids": ids,
-            "attention_mask": am,
-            "labels": ids.copy(),
-            "orig_idx": int(mapping[i]),
-        })
-    ds = Dataset.from_list(rows)
-    ds.set_format(type="torch", columns=["input_ids","attention_mask","labels","orig_idx"])
-    return ds
+    return X  
 
 
 def build_dataloader(path, tokenizer, block_size, batch_size):
     data = _read_json(path)
     texts = [item['text'] for item in data]
-    ds = tokenize_dataset_with_overflow(texts, tokenizer, block_size, stride=block_size//4)
+    ds = Dataset.from_dict({"text": texts})
+    ds = tokenize_dataset(ds, tokenizer, block_size)
     dl = DataLoader(ds, batch_size=batch_size)
     return dl, texts
 
@@ -337,9 +293,8 @@ def build_shadow_attack_dataset(
         print(f"[+] Processing shadow seed {seed}")
         train_path = Path(shadow_data_template[0].format(seed=seed))
         test_path = Path(shadow_data_template[1].format(seed=seed))
-        if not (train_path.exists() and test_path.exists()):
-            print(f"Files of {seed} not found.")
-            continue
+        assert train_path.exists(), f"{train_path} not found"
+        assert test_path.exists(), f"{test_path} not found"
 
 
         model_dir = shadow_model_dir_template.format(seed=seed)
@@ -364,24 +319,12 @@ def build_shadow_attack_dataset(
     return X, y
 
 
-def feval_tpr_at_001(y_pred, dtrain):
-    y_true = dtrain.get_label()
-    fpr, tpr, _ = roc_curve(y_true, y_pred)
-    import numpy as np
-    tpr001 = float(np.interp(0.01, fpr, tpr))
-    # higher is better
-    return "tpr_at_0.01", tpr001, True
-
-
 # --------------------
 # Train attack model & evaluate
 # --------------------
 def train_attack_model(X, y, out_dir: Path, random_state=42):
     print("Attack dataset shape:", X.shape, y.sum(), "members,", len(y)-y.sum(), "non-members")
     # split
-    out_dir.mkdir(parents=True, exist_ok=True)
-    np.save(out_dir / "attack_X.npy", X)
-    np.save(out_dir / "attack_y.npy", y)
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=random_state, stratify=y)
     dtrain = lgb.Dataset(X_train, label=y_train)
     dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
@@ -401,20 +344,17 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
         "lambda_l1": 1e-3,
         "lambda_l2": 1e-3,
         "verbose": -1,
-        "random_state": 42,
-        "is_unbalance": True,
+        "random_state": random_state,
     }
 
     # 训练 LightGBM 模型
     clf = lgb.train(
         params,
         dtrain,
-        valid_sets=[dval],
-        valid_names=["val"],
+        valid_sets=[dtrain, dval],
+        valid_names=["train", "val"],
         num_boost_round=4000,
-        feval=feval_tpr_at_001,
     )
-
     # validation metrics
     prob_val = clf.predict(X_val, num_iteration=clf.best_iteration)
     auc_score = roc_auc_score(y_val, prob_val)
@@ -429,7 +369,9 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
 
     print(f"Validation AUC = {auc_score:.4f}, TPR@FPR=0.01 = {tpr_at_target:.4f}")
 
-    
+    out_dir.mkdir(parents=True, exist_ok=True)
+    np.save(out_dir / "attack_X.npy", X)
+    np.save(out_dir / "attack_y.npy", y)
     print("Saved attack dataset to", out_dir)
     return clf, (auc_score, tpr_at_target)
 
@@ -465,10 +407,9 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
 # --------------------
 def main():
     parser = argparse.ArgumentParser()
-    # parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99,111,123,256,333,512,1024],
-    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33],
+    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99,111,123,256,333,512,1024],
                         help="list of seeds used to build shadow datasets")
-    parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
+    parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
                         help="format template for shadow model directories")
     parser.add_argument("--shadow_data_template", nargs=2, type=str,
                         default=("wiki_json/train/train_shadow_{seed}.json", "wiki_json/test/test_shadow_{seed}.json"),
@@ -489,12 +430,11 @@ def main():
         X = np.load(out_dir / "attack_X.npy")
         y = np.load(out_dir / "attack_y.npy")
     else:
-
         X, y = build_shadow_attack_dataset(
             seeds=args.shadow_seeds,
             shadow_data_template=(args.shadow_data_template[0], args.shadow_data_template[1]),
             shadow_model_dir_template=args.shadow_model_dir_template,
-            tokenizer_name_or_path=args.tokenizer,
+            tokenizer_name_or_path=args.target_model_dir,
             batch_size=args.batch_size,
             block_size=args.block_size,
             device=device,
