@@ -35,34 +35,26 @@ def _read_json(path: Path):
         return json.load(f)
 
 def _token_metrics_from_logits(logits, labels, attention_mask, rank_topk=(1,5,10)):
-    """
-    计算：true token logp, max prob, entropy, top1-top2 gap, rank top-k 命中等
-    返回一个 dict：包含各种 (B,) 的序列级统计或 (B, L-1) 的逐 token 数组
-    """
     log_probs = F.log_softmax(logits, dim=-1)              # (B, L, V)
     lp = log_probs[:, :-1, :]                              # (B, L-1, V)
     am = attention_mask[:, 1:].bool()                      # (B, L-1)
     true_lp = torch.gather(lp, -1, labels.unsqueeze(-1)).squeeze(-1)  # (B, L-1)
     true_lp = true_lp.masked_fill(~am, 0.0)
 
-    # 基本统计
     token_counts = am.sum(dim=1)                           # (B,)
     sum_logp = true_lp.sum(dim=1)
     avg_neg_nll = -(sum_logp / token_counts.clamp(min=1)) # (B,)
 
-    # 最大概率与熵
     token_max_logp = lp.max(dim=-1).values.masked_fill(~am, 0.0)
     avg_token_max_prob = (token_max_logp.exp().sum(dim=1) / token_counts.clamp(min=1))
 
     ent = torch.distributions.Categorical(logits=logits[:, :-1, :]).entropy().masked_fill(~am, 0.0)
     avg_token_entropy = (ent.sum(dim=1) / token_counts.clamp(min=1))
 
-    # top1-top2 gap
     topk_logp = lp.topk(2, dim=-1).values
     gap = (topk_logp[..., 0] - topk_logp[..., 1]).exp().masked_fill(~am, 0.0)
     avg_gap = (gap.sum(dim=1) / token_counts.clamp(min=1))
 
-    # rank top-k 命中率
     out = {
         "avg_neg_nll": avg_neg_nll,
         "avg_token_max_prob": avg_token_max_prob,
@@ -73,19 +65,16 @@ def _token_metrics_from_logits(logits, labels, attention_mask, rank_topk=(1,5,10
         "token_counts": token_counts # (B,)
     }
 
-    # top-k 命中（不计算精确 rank，效率友好）
     for k in rank_topk:
         tk = lp.topk(k, dim=-1).indices    # (B, L-1, k)
         hit = (tk == labels.unsqueeze(-1)).any(dim=-1) & am
         out[f"hit_top{k}_frac"] = (hit.sum(dim=1) / token_counts.clamp(min=1))  # (B,)
 
-    # 置信度尖峰 run-length（以 prob>0.99 为例，可多阈值）
     prob_true = true_lp.exp().masked_fill(~am, 0.0)  # (B, L-1)
     thr = 0.99
     runs = []
     for i in range(prob_true.size(0)):
         mask = (prob_true[i] > thr) & am[i]
-        # 计算最长连续长度
         max_run, cur = 0, 0
         for v in mask.tolist():
             if v: cur += 1
@@ -98,10 +87,6 @@ def _token_metrics_from_logits(logits, labels, attention_mask, rank_topk=(1,5,10
 
     return out
 def _window_aggregate(arr, am, win=128, stride=128, reduce="max"):
-    """
-    对 (B, L) 的逐 token 数组做窗口聚合，返回 (B,) 的序列级统计。
-    例如对 true ΔNLL 做窗口 max。
-    """
     B, L = arr.shape
     vals = []
     for i in range(B):
@@ -146,7 +131,6 @@ def extract_lm_features(
         attention_mask = batch["attention_mask"].to(device)  # (B, L)
         labels = batch["labels"][:, 1:].to(device)           # (B, L-1)
 
-        # forward
         outputs = model(input_ids, attention_mask=attention_mask)
         logits = outputs.logits                                # (B, L, V)
         m_ft = _token_metrics_from_logits(logits, labels, attention_mask)
@@ -155,25 +139,20 @@ def extract_lm_features(
             logits_base = model(input_ids, attention_mask=attention_mask).logits
         m_base = _token_metrics_from_logits(logits_base, labels, attention_mask)
 
-        # ΔNLL & 其他差异
         B = input_ids.size(0)
         am = m_ft["am"]
         true_lp_ft = m_ft["true_lp"]           # (B, L-1)
         true_lp_base = m_base["true_lp"]
         d_true_nll = -(true_lp_ft) - (-(true_lp_base))  # = NLL_ft - NLL_base
         d_true_nll = d_true_nll.masked_fill(~am, 0.0)   # (B, L-1)
-        # 我们更常用 Δ = NLL_base - NLL_ft
         delta_nll = -d_true_nll  # (B, L-1)
 
         token_counts = m_ft["token_counts"]
-
-        # 序列级 Δ 统计
         def seq_stat(x, am, reduce="mean"):
             x = x.masked_fill(~am, 0.0)
             if reduce == "mean":
                 return (x.sum(dim=1) / token_counts.clamp(min=1))
             elif reduce == "std":
-                # 逐样本有效 token 的 std
                 arr=[]
                 for i in range(B):
                     v = x[i][am[i]].detach().cpu().numpy()
@@ -184,8 +163,6 @@ def extract_lm_features(
 
         delta_nll_mean = seq_stat(delta_nll, am, "mean")   # (B,)
         delta_nll_std  = seq_stat(delta_nll, am, "std")    # (B,)
-
-        # ΔNLL 的分位数（逐样本）
         p_arrays = {p: [] for p in nll_percentiles}
         for i in range(B):
             v = delta_nll[i][am[i]].detach().cpu().numpy()
@@ -194,7 +171,6 @@ def extract_lm_features(
             else:
                 for p in nll_percentiles: p_arrays[p].append(np.percentile(v, p))
 
-        # 改进比例
         improved_frac = []
         for i in range(B):
             vb = true_lp_base[i][am[i]]
@@ -205,18 +181,15 @@ def extract_lm_features(
                 improved_frac.append(float((vf > vb).float().mean().item()))
         improved_frac = np.array(improved_frac, dtype=np.float32)
 
-        # 窗口极值（对 ΔNLL 做窗口 max / p95）
         delta_nll_np = delta_nll.detach().cpu().numpy()
         am_np = am.detach().cpu().numpy()
         win_max = _window_aggregate(delta_nll_np, am_np, win=128, stride=128, reduce="max")
         win_p95 = _window_aggregate(delta_nll_np, am_np, win=128, stride=128, reduce="p95")
 
-        # top-k 命中、尖峰 run
         hit1_ft = m_ft["hit_top1_frac"].detach().cpu().numpy()
         hit5_ft = m_ft["hit_top5_frac"].detach().cpu().numpy()
         run99_ft = m_ft["max_run_p099"].detach().cpu().numpy()
 
-        # 基础统计（ft & base）
         base_avg_nll = m_base["avg_neg_nll"].detach().cpu().numpy()
         ft_avg_nll   = m_ft["avg_neg_nll"].detach().cpu().numpy()
         base_entropy = m_base["avg_token_entropy"].detach().cpu().numpy()
@@ -228,7 +201,7 @@ def extract_lm_features(
             row = [
                 float(ft_avg_nll[i]),
                 float(base_avg_nll[i]),
-                float(base_avg_nll[i]-ft_avg_nll[i]),  # Δavg (base-ft)
+                float(base_avg_nll[i]-ft_avg_nll[i]),
                 float(ft_entropy[i]),
                 float(base_entropy[i]),
                 float(base_entropy[i]-ft_entropy[i]),
@@ -273,14 +246,6 @@ def build_shadow_attack_dataset(
     block_size: int,
     device: torch.device,
 ):
-    """
-    For each seed:
-      - read shadow train (member) and shadow test (non-member) files
-      - load corresponding shadow model
-      - extract features on both splits and label 1/0
-    Returns:
-      X (N, D), y (N,), meta list of dicts with {'seed','orig_id','text'}
-    """
     all_feats = []
     all_labels = []
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path, use_fast=True)
@@ -295,6 +260,8 @@ def build_shadow_attack_dataset(
         test_path = Path(shadow_data_template[1].format(seed=seed))
         assert train_path.exists(), f"{train_path} not found"
         assert test_path.exists(), f"{test_path} not found"
+        if not(train_path.exists() and test_path.exists()):
+            continue
 
 
         model_dir = shadow_model_dir_template.format(seed=seed)
@@ -329,7 +296,6 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
     dtrain = lgb.Dataset(X_train, label=y_train)
     dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
 
-    # LightGBM 参数
     params = {
         "objective": "binary",
         "metric": "auc",
@@ -347,7 +313,6 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
         "random_state": random_state,
     }
 
-    # 训练 LightGBM 模型
     clf = lgb.train(
         params,
         dtrain,
@@ -355,7 +320,6 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
         valid_names=["train", "val"],
         num_boost_round=4000,
     )
-    # validation metrics
     prob_val = clf.predict(X_val, num_iteration=clf.best_iteration)
     auc_score = roc_auc_score(y_val, prob_val)
     fpr, tpr, _ = roc_curve(y_val, prob_val)
@@ -375,39 +339,13 @@ def train_attack_model(X, y, out_dir: Path, random_state=42):
     print("Saved attack dataset to", out_dir)
     return clf, (auc_score, tpr_at_target)
 
-
-# --------------------
-# Predict on target model and prepare csv
-# --------------------
-# def predict_on_target_and_write_csv(
-#     clf,
-#     tokenizer_name_or_path: str,
-#     target_model_dir: str,
-#     target_texts: List[str],
-#     out_csv_path: Path,
-#     device: torch.device,
-# ):
-#     # load target model (or implement API query logic)
-#     model = AutoModelForCausalLM.from_pretrained(target_model_dir).to(device)
-#     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name_or_path)
-#     feats, ids = extract_lm_features(model, tokenizer, target_texts, device=device)
-#     probs = clf.predict_proba(feats)[:, 1]
-#     # write csv with id, score
-#     import csv
-#     with out_csv_path.open("w", newline='', encoding='utf-8') as f:
-#         writer = csv.writer(f)
-#         writer.writerow(["id", "score"])
-#         for i, p in enumerate(probs):
-#             writer.writerow([i, float(p)])
-#     print("Wrote predictions to", out_csv_path)
-
-
 # --------------------
 # Main CLI
 # --------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99,111,123,256,333,512,1024],
+    # parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33,99,111,123,256,333,512,1024],
+    parser.add_argument("--shadow_seeds", nargs="+", type=int, default=[7,15,33],
                         help="list of seeds used to build shadow datasets")
     parser.add_argument("--shadow_model_dir_template", type=str, default="models/shadow_models/shadow_{seed}/gpt2_3_lora32_adamw_b8_lr2",
                         help="format template for shadow model directories")
@@ -443,18 +381,6 @@ def main():
     
     clf, metrics = train_attack_model(X, y, out_dir)
     print("Attack model metrics (AUC, TPR@FPR=0.01):", metrics)
-
-    # # If target test file exists, run on it
-    # target_test_path = Path(args.target_test_json)
-    # if target_test_path.exists():
-    #     target_items = read_json(target_test_path)
-    #     target_texts = []
-    #     for i, it in enumerate(target_items):
-    #         text, _ = extract_text_and_id(it, i)
-    #         target_texts.append(text)
-    #     predict_on_target_and_write_csv(clf, args.tokenizer, args.target_model_dir, target_texts, out_dir / "target_predictions.csv", device)
-    # else:
-    #     print("No target test file found at", target_test_path, "; skip target prediction step.")
 
 if __name__ == "__main__":
     main()
